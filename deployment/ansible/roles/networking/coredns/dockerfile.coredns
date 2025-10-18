@@ -1,0 +1,9 @@
+FROM coredns/coredns:1.11.1
+
+# Copy configuration files directly
+COPY Corefile /etc/coredns/Corefile
+COPY zones/ /etc/coredns/zones/
+
+# Use direct 
+ENTRYPOINT ["/coredns"]
+CMD ["-conf", "/etc/coredns/Corefile"]

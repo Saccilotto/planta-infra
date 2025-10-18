@@ -1,0 +1,376 @@
+services:
+  traefik:
+    image: traefik:v2.9
+    command:
+      - "--api.insecure=false"
+      - "--api.dashboard=true"
+      - "--providers.docker=true"
+      - "--providers.docker.swarmMode=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      - "--certificatesresolvers.myresolver.acme.tlschallenge=true"
+      - "--certificatesresolvers.myresolver.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json"
+      - "--log.level=DEBUG"
+      - "--ping=true"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "${TRAEFIK_DASHBOARD_PORT:-8090}:8080"
+    volumes:
+      - traefik_data:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - traefik_network
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: '0.30'
+          memory: 256M
+        reservations:
+          cpus: '0.10'
+          memory: 128M
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.dashboard.rule=Host(`traefik.${DOMAIN_NAME:-cpplanta.duckdns.org}`)"
+        - "traefik.http.routers.dashboard.service=api@internal"
+        - "traefik.http.routers.dashboard.entrypoints=websecure"
+        - "traefik.http.routers.dashboard.tls.certresolver=myresolver"
+        - "traefik.http.middlewares.auth.basicauth.users=${TRAEFIK_DASHBOARD_USER:-admin}:${TRAEFIK_DASHBOARD_PASSWORD_HASH:-$$apr1$$uyBtMQYo$$TMK6XINUQz.mLxjdJsl1j.}"
+        - "traefik.http.services.traefik-svc.loadbalancer.server.port=8080"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--spider", "http://localhost:8080/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # DNS Service - Simplified configuration
+  dns:
+    image: norohim/coredns:latest
+    environment:
+      - TZ=${TZ:-America/Sao_Paulo}
+      - MANAGER_IP={{ manager_ip }}
+      - WORKER_IP={{ worker_ip }}
+      - DOMAIN_NAME=${DOMAIN_NAME:-cpplanta.duckdns.org}
+    volumes:
+      - ./zones:/etc/coredns/zones
+    networks:
+      - backend_network
+      - frontend_network
+      - traefik_network
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: any
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          cpus: '0.20'
+          memory: 128M
+      labels:
+        - "traefik.enable=false"
+
+  # PostgreSQL Primary Node
+  postgres_primary:
+    image: norohim/postgres-optimal
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - ROLE=primary
+      - NODE_ID=1
+      - NODE_NAME=primary
+      - NODE_HOST=postgres_primary
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_primary_data:/var/lib/postgresql/data
+    networks:
+      - backend_network
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: any
+        delay: 10s
+        max_attempts: 5
+      update_config:
+        order: start-first
+        failure_action: rollback
+      resources:
+        limits:
+          cpus: '0.75'
+          memory: 768M
+      labels:
+        - "traefik.enable=false"
+    ports:
+      - "${POSTGRES_PRIMARY_PORT:-5432}:5432"
+
+  # PostgreSQL Replica Node
+  postgres_replica:
+    image: norohim/postgres-optimal
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-postgres}
+      - ROLE=replica
+      - REPLICATE_FROM=postgres_primary
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data  
+    networks:
+      - backend_network
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == worker
+      restart_policy:
+        condition: any
+        delay: 30s
+        max_attempts: 5
+      labels:
+        - "traefik.enable=false"
+    ports:
+      - "${POSTGRES_REPLICA_PORT:-5433}:5432"
+    depends_on:
+      - postgres_primary
+
+  # PgBouncer Connection Pooler
+  pgbouncer:
+    image: norohim/pgbouncer:latest
+    environment:
+      - DB_USER=${POSTGRES_USER:-postgres}
+      - DB_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - DB_HOST=postgres_primary
+      - DB_NAME=${POSTGRES_DB:-postgres}
+      - POOL_MODE=transaction
+      - MAX_CLIENT_CONN=200
+    networks:
+      - backend_network
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: any
+        delay: 30s
+        max_attempts: 10
+      resources:
+        limits:
+          cpus: '0.30'
+          memory: 256M
+      labels:
+        - "traefik.enable=false"
+    ports:
+      - "${PGBOUNCER_PORT:-6432}:6432"
+    depends_on:   
+      - postgres_primary
+
+  backend:
+    image: norohim/cp-planta-backend:latest
+    environment:
+      - NODE_ENV=production
+      - DB_HOST=pgbouncer
+      - DB_PORT=6432
+      - DB_USER=${POSTGRES_USER:-postgres}
+      - DB_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - DB_NAME=${POSTGRES_DB:-postgres}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@pgbouncer:6432/${POSTGRES_DB:-postgres}
+    networks:
+      - backend_network
+      - traefik_network
+    command: node /app/dist/main.js
+    deploy:
+      replicas: 1
+      placement:
+        preferences:
+          - spread: node.role
+      resources:
+        limits:
+          cpus: '0.40'
+          memory: 384M
+        reservations:
+          cpus: '0.20'
+          memory: 192M
+      restart_policy:
+        condition: on-failure
+        delay: 60s
+        max_attempts: 5
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.backend.rule=Host(`api.${DOMAIN_NAME:-cpplanta.duckdns.org}`)"
+        - "traefik.http.routers.backend.entrypoints=websecure"
+        - "traefik.http.routers.backend.tls.certresolver=myresolver"
+        - "traefik.http.services.backend.loadbalancer.server.port=${BACKEND_PORT:-3000}"
+    ports:
+      - "${BACKEND_PORT:-3000}:${BACKEND_PORT:-3000}"
+    depends_on:
+      - pgbouncer
+      - postgres_primary
+        
+  pgadmin:
+    image: norohim/pgadmin:latest
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=${PGADMIN_DEFAULT_EMAIL:-admin@example.com}
+      - PGADMIN_DEFAULT_PASSWORD=${PGADMIN_DEFAULT_PASSWORD:-admin}
+      - PGADMIN_LISTEN_PORT=${PGADMIN_LISTEN_PORT:-5050}
+      # Add database connection configurations
+      - DB_HOST_PRIMARY=postgres_primary
+      - DB_PORT_PRIMARY=5432
+      - DB_HOST_REPLICA=postgres_replica
+      - DB_PORT_REPLICA=5432
+      - DB_HOST_BOUNCER=pgbouncer
+      - DB_PORT_BOUNCER=6432
+      - DB_USERNAME=${POSTGRES_USER:-postgres}
+      - DB_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - DB_DATABASE=${POSTGRES_DB:-postgres}
+    networks:
+      - backend_network
+      - traefik_network
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == worker
+      resources:
+        limits:
+          cpus: '0.30'
+          memory: 256M
+        reservations:
+          cpus: '0.10'
+          memory: 128M
+      restart_policy:
+        condition: any
+        delay: 30s
+        max_attempts: 5
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.pgadmin.rule=Host(`pgadmin.${DOMAIN_NAME:-cpplanta.duckdns.org}`)"
+        - "traefik.http.routers.pgadmin.entrypoints=websecure"
+        - "traefik.http.routers.pgadmin.tls.certresolver=myresolver"
+        - "traefik.http.services.pgadmin.loadbalancer.server.port=${PGADMIN_LISTEN_PORT:-5050}"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin 
+    depends_on: 
+      - postgres_primary
+      - pgbouncer
+
+  frontend:
+    image: norohim/cp-planta-frontend:latest
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_API_URL=https://api.${DOMAIN_NAME:-cpplanta.duckdns.org}
+      - PORT=${FRONTEND_PORT:-3001}
+    networks:
+      - frontend_network
+      - traefik_network
+    deploy:
+      replicas: 1
+      placement:
+        preferences:
+          - spread: node.role
+      resources:
+        limits:
+          cpus: '0.30'
+          memory: 256M
+        reservations:
+          cpus: '0.10'
+          memory: 128M
+      restart_policy:
+        condition: any
+        delay: 30s
+        max_attempts: 5
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.frontend.rule=Host(`${DOMAIN_NAME:-cpplanta.duckdns.org}`)"
+        - "traefik.http.routers.frontend.entrypoints=websecure"
+        - "traefik.http.routers.frontend.tls.certresolver=myresolver"
+        - "traefik.http.services.frontend.loadbalancer.server.port=${FRONTEND_PORT:-3001}"
+    depends_on:
+      - backend
+
+  duckdns:
+    image: linuxserver/duckdns:latest
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-America/Sao_Paulo}
+      - SUBDOMAINS=${DUCKDNS_SUBDOMAIN:-cpplanta}
+      - TOKEN=${DUCKDNS_TOKEN}
+      - LOG_FILE=false
+    networks:
+      - traefik_network
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: '0.10'
+          memory: 64M
+        reservations:
+          cpus: '0.05'
+          memory: 32M
+      restart_policy:  
+        condition: any
+        delay: 30s
+        max_attempts: 5
+      labels:
+        - "traefik.enable=false"
+
+  visualizer:
+    image: dockersamples/visualizer:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - traefik_network
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.visualizer.rule=Host(`viz.${DOMAIN_NAME:-cpplanta.duckdns.org}`)"
+        - "traefik.http.routers.visualizer.entrypoints=websecure"
+        - "traefik.http.routers.visualizer.tls.certresolver=myresolver"
+        - "traefik.http.services.visualizer.loadbalancer.server.port=8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080 || exit 1"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 10s
+
+networks:
+  backend_network:
+    driver: overlay
+  frontend_network:
+    driver: overlay
+  traefik_network:
+    driver: overlay
+
+volumes:
+  postgres_primary_data:
+    driver: local
+  postgres_replica_data:
+    driver: local
+  pgadmin_data:
+    driver: local
+  traefik_data:
+    driver: local

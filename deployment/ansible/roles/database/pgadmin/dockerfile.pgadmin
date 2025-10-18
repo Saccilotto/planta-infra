@@ -1,0 +1,7 @@
+FROM dpage/pgadmin4:latest
+
+# Copy the script to the container
+COPY pgadmin_setup.sh /opt/pgadmin_setup.sh
+
+# Start PgAdmin and run the setup script
+ENTRYPOINT ["/bin/bash", "/opt/pgadmin_setup.sh"]
